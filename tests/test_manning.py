@@ -56,13 +56,13 @@ class FakeSession:
 
 
 def fake_run(responses):
-    """Build a subprocess.run replacement mapping argv tuples to results."""
+    """Build a subprocess.run replacement mapping argv tuples to (returncode, stdout, stderr)."""
     calls = []
 
     def run(cmd, **kwargs):
         calls.append(cmd)
-        returncode, stdout = responses[tuple(cmd)]
-        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+        returncode, stdout, stderr = responses[tuple(cmd)]
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
     run.calls = calls
     return run
@@ -115,31 +115,84 @@ DASHBOARD = """
 # Keychain
 # --------------------------------------------------------------------------- #
 
+# Output formats below were captured from real `security find-generic-password -g`
+# runs: attributes go to stdout, the password line to stderr. Printable ASCII is
+# quoted verbatim (even embedded quotes); anything else is shown as 0xHEX + escapes.
+
+def _attrs(acct_value):
+    return (
+        'keychain: "/Users/me/Library/Keychains/login.keychain-db"\n'
+        'class: "genp"\n'
+        'attributes:\n'
+        f'    "acct"<blob>={acct_value}\n'
+        '    "svce"<blob>="manning"\n'
+    )
+
+
 def test_read_keychain_with_account_returns_password():
     run = fake_run({
-        ("security", "find-generic-password", "-s", "manning", "-a", "me@x.com", "-w"): (0, "s3cret\n"),
+        ("security", "find-generic-password", "-s", "manning", "-a", "me@x.com", "-g"):
+            (0, _attrs('"me@x.com"'), 'password: "s3cret"\n'),
     })
     assert manning.read_keychain("manning", "me@x.com", run=run) == ("me@x.com", "s3cret")
 
 
 def test_read_keychain_without_account_reads_account_attribute():
-    attrs = (
-        'keychain: "/Users/me/Library/Keychains/login.keychain-db"\n'
-        'class: "genp"\n'
-        'attributes:\n'
-        '    "acct"<blob>="me@x.com"\n'
-        '    "svce"<blob>="manning"\n'
-    )
     run = fake_run({
-        ("security", "find-generic-password", "-s", "manning"): (0, attrs),
-        ("security", "find-generic-password", "-s", "manning", "-a", "me@x.com", "-w"): (0, "s3cret\n"),
+        ("security", "find-generic-password", "-s", "manning", "-g"):
+            (0, _attrs('"me@x.com"'), 'password: "s3cret"\n'),
     })
     assert manning.read_keychain("manning", run=run) == ("me@x.com", "s3cret")
+    assert len(run.calls) == 1
+
+
+def test_read_keychain_keeps_quotes_and_spaces_in_ascii_password():
+    run = fake_run({
+        ("security", "find-generic-password", "-s", "manning", "-g"):
+            (0, _attrs('"me@x.com"'), 'password: "pa"ss word"\n'),
+    })
+    assert manning.read_keychain("manning", run=run) == ("me@x.com", 'pa"ss word')
+
+
+def test_read_keychain_does_not_mistake_hex_looking_password_for_hex():
+    run = fake_run({
+        ("security", "find-generic-password", "-s", "manning", "-g"):
+            (0, _attrs('"me@x.com"'), 'password: "cafe1234"\n'),
+    })
+    assert manning.read_keychain("manning", run=run)[1] == "cafe1234"
+
+
+def test_read_keychain_decodes_non_ascii_password_and_account():
+    run = fake_run({
+        ("security", "find-generic-password", "-s", "manning", "-g"):
+            (0, _attrs('0x6DC3A440782E636F6D  "m\\303\\244@x.com"'),
+             'password: 0x70C3A47373776F7274  "p\\303\\244sswort"\n'),
+    })
+    assert manning.read_keychain("manning", run=run) == ("mä@x.com", "pässwort")
+
+
+def test_read_keychain_item_without_account_raises():
+    run = fake_run({
+        ("security", "find-generic-password", "-s", "manning", "-g"):
+            (0, _attrs("<NULL>"), 'password: "s3cret"\n'),
+    })
+    with pytest.raises(manning.CredentialError, match="-u"):
+        manning.read_keychain("manning", run=run)
+
+
+def test_read_keychain_empty_password_raises():
+    run = fake_run({
+        ("security", "find-generic-password", "-s", "manning", "-a", "me@x.com", "-g"):
+            (0, _attrs('"me@x.com"'), 'password: \n'),
+    })
+    with pytest.raises(manning.CredentialError, match="password"):
+        manning.read_keychain("manning", "me@x.com", run=run)
 
 
 def test_read_keychain_missing_item_raises():
     run = fake_run({
-        ("security", "find-generic-password", "-s", "nope", "-a", "me@x.com", "-w"): (44, ""),
+        ("security", "find-generic-password", "-s", "nope", "-a", "me@x.com", "-g"):
+            (44, "", "security: SecKeychainSearchCopyNext: The specified item could not be found.\n"),
     })
     with pytest.raises(manning.CredentialError, match="nope"):
         manning.read_keychain("nope", "me@x.com", run=run)
@@ -302,8 +355,26 @@ def test_safe_name(title, expected):
 # Downloading
 # --------------------------------------------------------------------------- #
 
-def _product():
-    return manning.parse_dashboard(DASHBOARD)[0]
+def _product(title="Terraform in Action", external_id="winkler"):
+    return manning.Product(title, external_id, [("dropbox", "false"), ("productExternalId", external_id),
+                                                ("1", "a"), ("x", "1"), ("2", "b"), ("x", "2")])
+
+
+def test_folder_names_unique_titles_unchanged():
+    products = [_product("Rust in Action", "a"), _product("Go in Action", "b")]
+    assert manning.folder_names(products) == ["Rust_in_Action", "Go_in_Action"]
+
+
+def test_folder_names_disambiguates_collisions_with_product_id():
+    products = [
+        _product("C# in Depth", "skeet"),
+        _product("C in Depth", "other"),
+        _product("c in depth", "lower"),   # case-insensitive filesystems (APFS default)
+        _product("Unique", "u"),
+    ]
+    assert manning.folder_names(products) == [
+        "C_in_Depth_skeet", "C_in_Depth_other", "c_in_depth_lower", "Unique",
+    ]
 
 
 def test_download_writes_file_using_server_filename_extension(tmp_path):
@@ -343,3 +414,58 @@ def test_download_http_error_leaves_no_partial_file(tmp_path):
     with pytest.raises(manning.DownloadError):
         manning.download_product(session, _product(), tmp_path)
     assert not list(tmp_path.rglob("*.part"))
+
+
+def test_download_uses_given_folder_name(tmp_path):
+    session = FakeSession(post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"zip")])
+    path = manning.download_product(session, _product(), tmp_path, name="Custom_x")
+    assert path == tmp_path / "Custom_x" / "Custom_x.zip"
+
+
+def test_download_filesystem_error_becomes_download_error(tmp_path):
+    blocker = tmp_path / "Terraform_in_Action"
+    blocker.write_text("a file where the book folder should go")
+    session = FakeSession()
+    with pytest.raises(manning.DownloadError, match="Terraform in Action"):
+        manning.download_product(session, _product(), tmp_path)
+
+
+def _existing(tmp_path, ext=".zip", data=b"12345"):
+    path = tmp_path / "Terraform_in_Action" / f"Terraform_in_Action{ext}"
+    path.parent.mkdir()
+    path.write_bytes(data)
+    return path
+
+
+def test_update_skips_when_remote_size_matches(tmp_path):
+    existing = _existing(tmp_path)
+    resp = FakeResponse(headers={"Content-Type": "application/zip", "Content-Length": "5"}, content=b"NEWER")
+    session = FakeSession(post=[resp])
+    assert manning.download_product(session, _product(), tmp_path, update=True) is None
+    assert existing.read_bytes() == b"12345"
+
+
+def test_update_replaces_file_when_remote_size_differs(tmp_path):
+    existing = _existing(tmp_path, ext=".pdf")
+    resp = FakeResponse(headers={"Content-Type": "application/zip", "Content-Length": "9"}, content=b"new-bytes")
+    session = FakeSession(post=[resp])
+    path = manning.download_product(session, _product(), tmp_path, update=True)
+    assert path == tmp_path / "Terraform_in_Action" / "Terraform_in_Action.zip"
+    assert path.read_bytes() == b"new-bytes"
+    assert not existing.exists()  # old file with a different extension is removed
+
+
+def test_update_redownloads_when_size_unknown(tmp_path):
+    _existing(tmp_path)
+    resp = FakeResponse(headers={"Content-Type": "application/zip"}, content=b"new-bytes")
+    session = FakeSession(post=[resp])
+    path = manning.download_product(session, _product(), tmp_path, update=True)
+    assert path.read_bytes() == b"new-bytes"
+
+
+def test_download_all_continues_after_failures_and_counts_them(tmp_path):
+    (tmp_path / "Broken").write_text("blocks folder creation")
+    products = [_product("Broken", "b"), _product("Good Book", "g")]
+    session = FakeSession(post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"ok")])
+    assert manning.download_all(session, products, tmp_path) == 1
+    assert (tmp_path / "Good_Book" / "Good_Book.zip").read_bytes() == b"ok"

@@ -1,19 +1,32 @@
 # Manning Publications Ebooks Downloader
 
-[![GitHub license](https://img.shields.io/github/license/luckylittle/Manning-Publications-Ebooks-Downloader.svg)](https://github.com/luckylittle/Manning-Publications-Ebooks-Downloader/blob/master/LICENSE)
+[![GitHub license](https://img.shields.io/github/license/iliyan-s-petkov/Manning-Publications-Ebooks-Downloader.svg)](LICENSE)
 
-If you are like me and you have bought a lot of (50+) IT ebooks from [Manning Publications](https://www.manning.com/), you might be looking for a tool that can programatically download them in a nice, organized way. You came to the right place!
+Download every ebook you own from your [Manning Publications](https://www.manning.com/) dashboard in one go, organised into one folder per book.
+
+> Fork of [luckylittle/Manning-Publications-Ebooks-Downloader](https://github.com/luckylittle/Manning-Publications-Ebooks-Downloader) (2020), modernised for Manning's current login flow, with macOS Keychain support, safer downloads and a test suite.
 
 Screenshot of the owned products dashboard:
 
 ![Dashboard](img/dashboard.png)
 
+## Features
+
+- Credentials from the **macOS Keychain**, a **hidden password prompt**, or the command line
+- Works with Manning's current sign-in form (one-time tokens are read from the page)
+- **Resumable**: books already downloaded are skipped; partial downloads are never kept
+- `--update` re-downloads only books whose file size changed on the server (e.g. new MEAP versions)
+- Clear errors for wrong password, changed site layout, expired session or disk problems; one failing book does not stop the run
+- Book folder names are sanitised and never collide
+
 ## Requirements
 
-Python 3.9+.
+- Python **3.10+**
+- macOS for `--keychain` (all other options work on Linux/Windows too)
 
 ```bash
-# Install Python packages inside virtual environment:
+git clone https://github.com/iliyan-s-petkov/Manning-Publications-Ebooks-Downloader.git
+cd Manning-Publications-Ebooks-Downloader
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -21,105 +34,138 @@ pip install -r requirements.txt
 
 ## Usage
 
-```bash
-./manning.py -h
-# usage: manning.py [-h] [-k SERVICE] [-u EMAIL] [-p PASSWORD] [-o OUTPUT] [-f] [-v]
+```text
+./manning.py [-h] [-k SERVICE] [-u EMAIL] [-p PASSWORD] [-o OUTPUT] [-f | -U] [--user-agent UA] [-v]
 ```
 
-### Recommended: credentials from the macOS Keychain
+| Option | Description |
+|---|---|
+| `-k`, `--keychain SERVICE` | Read email and password from the macOS Keychain item with this service name |
+| `-u`, `--username EMAIL` | Manning account email (optional with `--keychain`; prompted if omitted) |
+| `-p`, `--password PASSWORD` | Password on the command line (**insecure**, see below) |
+| `-o`, `--output DIR` | Output directory (default: `Manning_<YYYY-MM-DD>`) |
+| `-f`, `--force` | Re-download every book, even if it already exists |
+| `-U`, `--update` | Re-download existing books only when the server reports a different size |
+| `--user-agent UA` | HTTP User-Agent to send (default: a recent desktop Chrome) |
+| `-v`, `--verbose` | Debug logging |
 
-Store your Manning login once. `-w` as the last option makes `security` prompt for the password, so it never lands in your shell history:
+### Credentials
+
+The script picks the first available source: `--keychain`, then `-p`, then an interactive prompt.
+
+#### 1. macOS Keychain (recommended)
+
+Store your login once. Putting `-w` last makes `security` prompt for the password, so it never lands in your shell history:
 
 ```bash
-security add-generic-password -s manning -a user@domain.com -w
+security add-generic-password -s manning -a you@example.com -w
 ```
 
-Then run:
+Then:
 
 ```bash
 ./manning.py --keychain manning
-# Logged in as user@domain.com
-# Found 57 downloadable books
-# Downloading AWS Security ...
-# ...
 ```
 
-The account email is read from the Keychain item. If you have several `manning` items, pick one with `-u user@domain.com`. On first use macOS may ask whether `security` may access the item; choose **Allow** (or **Always Allow**).
+The email is taken from the Keychain item. If you keep several items with the same service name, choose one with `-u you@example.com`. On first use macOS asks whether `security` may access the item; choose **Allow** or **Always Allow**. Passwords and emails with non-ASCII characters are supported.
 
-### Alternative: type the password at a prompt
-
-Without `--keychain` or `-p`, the script asks for the email (unless `-u` is given) and reads the password with `getpass` (hidden input). This requires an interactive terminal; in cron or pipes use `--keychain`.
+To change or remove the stored password:
 
 ```bash
-./manning.py -u user@domain.com
-# Manning password for user@domain.com:
+security add-generic-password -U -s manning -a you@example.com -w   # update
+security delete-generic-password -s manning -a you@example.com      # remove
 ```
 
-### Other options
+#### 2. Interactive prompt
+
+Without `--keychain` or `-p`, the script asks for your email (unless `-u` is given) and reads the password with hidden input:
 
 ```bash
-./manning.py -u user@domain.com -p secretpassword   # works, but exposes the password in history / `ps`
-./manning.py -k manning -o ~/Books/Manning           # custom output directory
-./manning.py -k manning -f                           # re-download books that already exist
+./manning.py -u you@example.com
+# Manning password for you@example.com:
 ```
 
-Books that already exist in the output folder are skipped, so an interrupted run can simply be restarted. Downloads are written to a `.part` file first and renamed when complete.
+This needs an interactive terminal. In cron jobs or pipes the script exits with an error instead of waiting; use `--keychain` there.
 
-## Tests
+#### 3. Command line (not recommended)
+
+```bash
+./manning.py -u you@example.com -p 'secret'
+```
+
+Works, but the password is saved in your shell history and visible to other processes (`ps`) while the script runs. A warning is printed.
+
+### Examples
+
+```bash
+./manning.py -k manning                        # download everything into Manning_<today>/
+./manning.py -k manning -o ~/Books/Manning     # use a fixed library folder
+./manning.py -k manning -o ~/Books/Manning -U  # later: fetch only new or changed books
+./manning.py -k manning -o ~/Books/Manning -f  # re-download everything
+```
+
+Example output:
+
+```text
+Logged in as you@example.com
+Found 57 downloadable books
+Downloading AWS Security ...
+Skipping Rust in Action (already downloaded; use --update to check for a newer version)
+...
+Done: 57 books, 0 failed. Output: /Users/you/Books/Manning
+```
+
+The exit code is `0` when everything succeeded and `1` if login failed or any book failed.
+
+## Result
+
+One folder per book. Most titles are a `.zip` containing `PDF` and `EPUB` (and, for older books, `MOBI`); some free titles are a single `.pdf`:
+
+```text
+Manning_2026-09-16
+├── AWS_Security
+│   └── AWS_Security.zip
+├── Azure_Storage_Streaming_and_Batch_Analytics
+│   └── Azure_Storage_Streaming_and_Batch_Analytics.zip
+├── Rust_in_Action
+│   └── Rust_in_Action.zip
+...
+```
+
+Folder names keep letters, digits, `.`, `+` and `-`; everything else becomes `_`. If two titles end up with the same name (e.g. `C# in Depth` and `C in Depth`), the Manning product id is appended to both.
+
+While a book is downloading it is written to `<name>.part` and renamed when complete, so an interrupted run can simply be started again.
+
+To unzip everything and remove the archives:
+
+```bash
+find Manning_2026-09-16/ -name '*.zip' -execdir unzip -o {} \; -delete
+```
+
+## Troubleshooting
+
+| Message | Meaning / fix |
+|---|---|
+| `No Keychain item found for service "manning"` | Create the item (see above) or check the service name with `security find-generic-password -s manning` |
+| `Login failed: check your email/password.` | Wrong credentials, or the account needs a login step the script cannot do (e.g. social login only: set a Manning password first) |
+| `Sign-in form not found on the login page` / `Product table not found on the dashboard` | Manning changed its website; the parser needs updating. Please open an issue |
+| `Got an HTML page instead of a file` | Session expired or the download form changed; rerun, and open an issue if it persists |
+| Connection errors / HTTP 403 | Network problem or the site is rate-limiting; wait and retry. You can also try `--user-agent` with your browser's User-Agent string |
+
+## Development
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-## Result
-
-* As you can see in the example below, there is one `*.zip` per folder:
-
-```bash
-tree Manning_2020-09-13
-# Manning_2020-09-13
-# ├── AWS_Security
-# │   └── AWS_Security.zip
-# ├── Azure_Storage,_Streaming,_and_Batch_Analytics
-# │   └── Azure_Storage,_Streaming,_and_Batch_Analytics.zip
-# ├── Beyond_Spreadsheets_with_R
-# │   └── Beyond_Spreadsheets_with_R.zip
-# ├── Elastic_Leadership
-# │   └── Elastic_Leadership.zip
-# ├── Event_Streams_in_Action
-# │   └── Event_Streams_in_Action.zip
-# ├── Five_Lines_of_Code
-# │   └── Five_Lines_of_Code.zip
-# ...
-```
-
-* Each `*.zip` file contains `PDF`, `EPUB`, `MOBI`:
-
-```bash
-zipinfo Manning_2020-09-13/AWS_Security/AWS_Security.zip
-# Archive:  AWS_Security.zip
-# Zip file size: 14443760 bytes, number of entries: 3
-# -rw----     2.0 fat  8008077 bl defN 20-Sep-13 06:36 AWS_Security_v3_MEAP.pdf
-# -rw----     2.0 fat  4457182 bl defN 20-Sep-13 06:36 AWS_Security_v3_MEAP.epub
-# -rw----     2.0 fat  3016348 bl defN 20-Sep-13 06:36 AWS_Security_v3_MEAP.mobi
-#  files, 15481607 bytes uncompressed, 14443314 bytes compressed:  6.7%
-```
-
-* To unzip all of the files (and remove the original `*.zip`):
-
-```bash
-find Manning_2020-09-13/ -name '*.zip' -execdir unzip -o {} \; -delete
-```
-
-## Stars
-
-[![Stargazers over time](https://starchart.cc/luckylittle/Manning-Publications-Ebooks-Downloader.svg)](https://starchart.cc/luckylittle/Manning-Publications-Ebooks-Downloader)
+The tests use fakes for HTTP and the `security` tool, so they need neither network access nor a Manning account.
 
 ## Contributors
 
-Lucian Maly <<lucian@redhat.com>>
+- Lucian Maly <<lucian@redhat.com>> (original author)
+- Iliyan Petkov (modernisation)
 
----
+## License
 
-_Last Update: 2026-09-16 (modernized: Keychain credentials, new CAS login, resumable downloads)_
+[MIT](LICENSE)
