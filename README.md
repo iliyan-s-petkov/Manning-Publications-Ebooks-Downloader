@@ -10,6 +10,8 @@ Screenshot of the owned products dashboard:
 
 ## Requirements
 
+Python 3.9+.
+
 ```bash
 # Install Python packages inside virtual environment:
 python3 -m venv venv
@@ -17,36 +19,48 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Tested on:
-
-```bash
-uname -a
-# Linux lmaly.remote.csb 4.18.0-80.11.2.el8_0.x86_64 #1 SMP Sun Sep 15 11:24:21 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
-
-python --version
-# Python 3.6.8
-```
-
 ## Usage
-
-* Run the help to see the usage:
 
 ```bash
 ./manning.py -h
-# Usage: `manning.py -u <email> -p <password>`
+# usage: manning.py [-h] [-k SERVICE] [-u EMAIL] [-p PASSWORD] [-o OUTPUT] [-f] [-v]
 ```
 
-* Execute the process by providing the username/e-mail and the password. Top level folder with the current date will be created and all of your books will be stored underneath it:
+### Recommended: credentials from the macOS Keychain
+
+Store your Manning login once. `-w` as the last option makes `security` prompt for the password, so it never lands in your shell history:
 
 ```bash
-./manning.py -u user@domain.com -p secretpassword
-# Created folder Manning_2020-09-13
-# Created folder Manning_2020-09-13/AWS_Security
-# Created folder Manning_2020-09-13/Transfer_Learning_for_Natural_Language_Processing
-# Created folder Manning_2020-09-13/Rust_in_Action
-# Created folder Manning_2020-09-13/Math_and_Architectures_of_Deep_Learning
-# Created folder Manning_2020-09-13/Learn_Kubernetes_in_a_Month_of_Lunches
+security add-generic-password -s manning -a user@domain.com -w
+```
+
+Then run:
+
+```bash
+./manning.py --keychain manning
+# Logged in as user@domain.com
+# Found 57 downloadable books
+# Downloading AWS Security ...
 # ...
+```
+
+The account email is read from the Keychain item. If you have several `manning` items, pick one with `-u user@domain.com`. On first use macOS may ask whether `security` may access the item; choose **Allow** (or **Always Allow**).
+
+### Other options
+
+```bash
+./manning.py -u user@domain.com -p secretpassword   # works, but exposes the password in history / `ps`
+./manning.py -k manning -o ~/Books/Manning           # custom output directory
+./manning.py -k manning -f                           # re-download books that already exist
+```
+
+Books that already exist in the output folder are skipped, so an interrupted run can simply be restarted. Downloads are written to a `.part` file first and renamed when complete.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ## Result
@@ -99,4 +113,4 @@ Lucian Maly <<lucian@redhat.com>>
 
 ---
 
-_Last Update: Tue Sep 15 12:30:33 UTC 2020_
+_Last Update: 2026-09-16 (modernized: Keychain credentials, new CAS login, resumable downloads)_
