@@ -384,7 +384,7 @@ def test_download_writes_file_using_server_filename_extension(tmp_path):
         content=b"%PDF-1.7 data",
     )
     session = FakeSession(post=[resp])
-    path = manning.download_product(session, _product(), tmp_path)
+    path = manning.download_product(session, _product(), tmp_path).path
     assert path == tmp_path / "Terraform_in_Action" / "Terraform_in_Action.pdf"
     assert path.read_bytes() == b"%PDF-1.7 data"
     assert session.calls[0][2]["stream"] is True
@@ -396,7 +396,7 @@ def test_download_skips_existing_file(tmp_path):
     existing.parent.mkdir()
     existing.write_bytes(b"old")
     session = FakeSession()
-    assert manning.download_product(session, _product(), tmp_path) is None
+    assert manning.download_product(session, _product(), tmp_path).status == "skipped"
     assert session.calls == []
 
 
@@ -418,7 +418,7 @@ def test_download_http_error_leaves_no_partial_file(tmp_path):
 
 def test_download_uses_given_folder_name(tmp_path):
     session = FakeSession(post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"zip")])
-    path = manning.download_product(session, _product(), tmp_path, name="Custom_x")
+    path = manning.download_product(session, _product(), tmp_path, name="Custom_x").path
     assert path == tmp_path / "Custom_x" / "Custom_x.zip"
 
 
@@ -441,7 +441,7 @@ def test_update_skips_when_remote_size_matches(tmp_path):
     existing = _existing(tmp_path)
     resp = FakeResponse(headers={"Content-Type": "application/zip", "Content-Length": "5"}, content=b"NEWER")
     session = FakeSession(post=[resp])
-    assert manning.download_product(session, _product(), tmp_path, update=True) is None
+    assert manning.download_product(session, _product(), tmp_path, update=True).status == "unchanged"
     assert existing.read_bytes() == b"12345"
 
 
@@ -449,7 +449,7 @@ def test_update_replaces_file_when_remote_size_differs(tmp_path):
     existing = _existing(tmp_path, ext=".pdf")
     resp = FakeResponse(headers={"Content-Type": "application/zip", "Content-Length": "9"}, content=b"new-bytes")
     session = FakeSession(post=[resp])
-    path = manning.download_product(session, _product(), tmp_path, update=True)
+    path = manning.download_product(session, _product(), tmp_path, update=True).path
     assert path == tmp_path / "Terraform_in_Action" / "Terraform_in_Action.zip"
     assert path.read_bytes() == b"new-bytes"
     assert not existing.exists()  # old file with a different extension is removed
@@ -459,7 +459,7 @@ def test_update_redownloads_when_size_unknown(tmp_path):
     _existing(tmp_path)
     resp = FakeResponse(headers={"Content-Type": "application/zip"}, content=b"new-bytes")
     session = FakeSession(post=[resp])
-    path = manning.download_product(session, _product(), tmp_path, update=True)
+    path = manning.download_product(session, _product(), tmp_path, update=True).path
     assert path.read_bytes() == b"new-bytes"
 
 
@@ -467,5 +467,80 @@ def test_download_all_continues_after_failures_and_counts_them(tmp_path):
     (tmp_path / "Broken").write_text("blocks folder creation")
     products = [_product("Broken", "b"), _product("Good Book", "g")]
     session = FakeSession(post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"ok")])
-    assert manning.download_all(session, products, tmp_path) == 1
+    summary = manning.download_all(session, products, tmp_path, sleep=lambda s: None)
+    assert (summary.downloaded, summary.failed) == (1, 1)
     assert (tmp_path / "Good_Book" / "Good_Book.zip").read_bytes() == b"ok"
+
+
+def test_download_all_pauses_only_between_network_downloads(tmp_path):
+    _existing(tmp_path)  # Terraform in Action is already on disk -> skipped, no pause
+    products = [_product(), _product("Book A", "a"), _product("Book B", "b")]
+    ok = lambda: FakeResponse(headers={"Content-Type": "application/zip"}, content=b"ok")  # noqa: E731
+    session = FakeSession(post=[ok(), ok()])
+    pauses = []
+    summary = manning.download_all(session, products, tmp_path, delay=2.5, sleep=pauses.append)
+    assert (summary.downloaded, summary.skipped, summary.failed) == (2, 1, 0)
+    assert pauses == [2.5]
+
+
+def test_download_all_logs_progress_in_plain_language(tmp_path, caplog):
+    caplog.set_level("INFO", logger="manning")
+    session = FakeSession(post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"x" * 2048)])
+    manning.download_all(session, [_product()], tmp_path, sleep=lambda s: None)
+    text = caplog.text
+    assert "(1/1) Terraform in Action" in text
+    assert "saved" in text and "KB" in text
+
+
+# --------------------------------------------------------------------------- #
+# main()
+# --------------------------------------------------------------------------- #
+
+class FakeSessionCM(FakeSession):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.headers = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _run_main(monkeypatch, tmp_path, dashboard_html):
+    session = FakeSessionCM(get=[FakeResponse(dashboard_html)])
+    monkeypatch.setattr(manning.requests, "Session", lambda: session)
+    monkeypatch.setattr(manning, "login", lambda s, u, p: None)
+    monkeypatch.setattr(manning, "read_keychain", lambda service, account=None: ("me@x.com", "pw"))
+    return manning.main(["-k", "manning", "-o", str(tmp_path), "--delay", "0"])
+
+
+def test_main_saves_dashboard_page_when_no_books_found(monkeypatch, tmp_path, caplog):
+    caplog.set_level("INFO", logger="manning")
+    html = '<table id="productTable"><tr class="new-layout-row"></tr></table>'
+    assert _run_main(monkeypatch, tmp_path, html) == 1
+    saved = tmp_path / manning.DASHBOARD_DEBUG_FILE
+    assert saved.read_text() == html
+    assert str(saved) in caplog.text
+
+
+def test_main_saves_dashboard_page_when_layout_unrecognised(monkeypatch, tmp_path):
+    html = "<html>completely new dashboard</html>"
+    assert _run_main(monkeypatch, tmp_path, html) == 1
+    assert (tmp_path / manning.DASHBOARD_DEBUG_FILE).read_text() == html
+
+
+def test_main_explains_each_step(monkeypatch, tmp_path, caplog):
+    caplog.set_level("INFO", logger="manning")
+    session = FakeSessionCM(
+        get=[FakeResponse(DASHBOARD)],
+        post=[FakeResponse(headers={"Content-Type": "application/zip"}, content=b"z")] * 2,
+    )
+    monkeypatch.setattr(manning.requests, "Session", lambda: session)
+    monkeypatch.setattr(manning, "login", lambda s, u, p: None)
+    monkeypatch.setattr(manning, "read_keychain", lambda service, account=None: ("me@x.com", "pw"))
+    assert manning.main(["-k", "manning", "-o", str(tmp_path), "--delay", "0"]) == 0
+    text = caplog.text
+    for expected in ("macOS Keychain", "Signing in", "me@x.com", "library", "Found 2 books", "Downloaded 2"):
+        assert expected in text, expected

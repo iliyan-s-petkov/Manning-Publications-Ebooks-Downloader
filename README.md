@@ -35,7 +35,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```text
-./manning.py [-h] [-k SERVICE] [-u EMAIL] [-p PASSWORD] [-o OUTPUT] [-f | -U] [--user-agent UA] [-v]
+./manning.py [-h] [-k SERVICE] [-u EMAIL] [-p PASSWORD] [-o OUTPUT] [-f | -U] [--delay SECONDS] [--user-agent UA] [-v]
 ```
 
 | Option | Description |
@@ -46,8 +46,9 @@ pip install -r requirements.txt
 | `-o`, `--output DIR` | Output directory (default: `Manning_<YYYY-MM-DD>`) |
 | `-f`, `--force` | Re-download every book, even if it already exists |
 | `-U`, `--update` | Re-download existing books only when the server reports a different size |
+| `--delay SECONDS` | Pause between downloads so Manning does not rate-limit you (default: `2`) |
 | `--user-agent UA` | HTTP User-Agent to send (default: a recent desktop Chrome) |
-| `-v`, `--verbose` | Debug logging |
+| `-v`, `--verbose` | More detail; `-vv` also shows every HTTP request |
 
 ### Credentials
 
@@ -107,12 +108,19 @@ Works, but the password is saved in your shell history and visible to other proc
 Example output:
 
 ```text
-Logged in as you@example.com
-Found 57 downloadable books
-Downloading AWS Security ...
-Skipping Rust in Action (already downloaded; use --update to check for a newer version)
+[1/4] Reading your Manning login from the macOS Keychain (item "manning")...
+[2/4] Signing in to Manning as you@example.com...
+      Signed in.
+[3/4] Loading your library from the Manning dashboard...
+      Found 57 books with downloadable files.
+[4/4] Downloading into /Users/you/Books/Manning (pausing 2s between downloads)...
+(1/57) AWS Security: downloading...
+(1/57) AWS Security: saved AWS_Security.zip (13.6 MB)
+(2/57) Rust in Action: already downloaded, skipping
 ...
-Done: 57 books, 0 failed. Output: /Users/you/Books/Manning
+
+Done. Downloaded 41, skipped 16 (already present), unchanged 0, failed 0.
+Tip: run with --update to check skipped books for newer versions.
 ```
 
 The exit code is `0` when everything succeeded and `1` if login failed or any book failed.
@@ -148,9 +156,10 @@ find Manning_2026-09-16/ -name '*.zip' -execdir unzip -o {} \; -delete
 |---|---|
 | `No Keychain item found for service "manning"` | Create the item (see above) or check the service name with `security find-generic-password -s manning` |
 | `Login failed: check your email/password.` | Wrong credentials, or the account needs a login step the script cannot do (e.g. social login only: set a Manning password first) |
-| `Sign-in form not found on the login page` / `Product table not found on the dashboard` | Manning changed its website; the parser needs updating. Please open an issue |
+| `Sign-in form not found on the login page` | Manning changed its sign-in page; the parser needs updating. Please open an issue |
+| `No downloadable books were found on the dashboard` / `Product table not found` | Manning changed its dashboard. The page is saved as `dashboard-debug.html` in the output folder; attach it to an issue (it lists your library, but contains no password) |
 | `Got an HTML page instead of a file` | Session expired or the download form changed; rerun, and open an issue if it persists |
-| Connection errors / HTTP 403 | Network problem or the site is rate-limiting; wait and retry. You can also try `--user-agent` with your browser's User-Agent string |
+| `Connection refused` / HTTP 403 / timeouts, while other sites work | Manning's servers have probably blocked your IP address for a while after too many automated requests; this also affects your browser. Wait (usually hours up to a day), or use a VPN meanwhile. Contact Manning support if it lasts. Keep `--delay` at 2 seconds or more. You can also try `--user-agent` with your browser's User-Agent string |
 
 ## Development
 

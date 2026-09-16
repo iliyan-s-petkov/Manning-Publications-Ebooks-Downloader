@@ -16,6 +16,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -38,6 +39,12 @@ DEFAULT_USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebK
                       '(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36')
 TIMEOUT = 60  # seconds, per request (connect/read), not total download time
 CHUNK_SIZE = 1024 * 256
+# Pause between downloads. Rapid automated requests can get your IP temporarily
+# blocked by Manning's servers, so be gentle by default.
+DEFAULT_DELAY = 2.0
+# Written into the output folder when the dashboard cannot be parsed, so the page
+# can be inspected and the parser updated.
+DASHBOARD_DEBUG_FILE = 'dashboard-debug.html'
 
 log = logging.getLogger('manning')
 
@@ -123,7 +130,7 @@ def read_keychain(service: str, account: str | None = None, run: Runner = subpro
 
 
 def resolve_credentials(args: argparse.Namespace,
-                        keychain_reader: Callable[[str, str | None], tuple[str, str]] = read_keychain,
+                        keychain_reader: Callable[[str, str | None], tuple[str, str]] | None = None,
                         prompt_username: Callable[[str], str] = input,
                         prompt_password: Callable[[str], str] = getpass.getpass,
                         is_interactive: Callable[[], bool] = lambda: sys.stdin.isatty(),
@@ -132,7 +139,8 @@ def resolve_credentials(args: argparse.Namespace,
     if args.keychain and args.password:
         raise CredentialError('Use either --keychain or -p/--password, not both.')
     if args.keychain:
-        return keychain_reader(args.keychain, args.username)
+        # Resolved at call time (not as a default argument) so it can be swapped in tests.
+        return (keychain_reader or read_keychain)(args.keychain, args.username)
     if args.password:
         if not args.username:
             raise CredentialError('-p/--password requires -u/--username.')
@@ -271,12 +279,36 @@ def _same_size(existing: list[Path], headers) -> bool:
     return length.isdigit() and any(p.stat().st_size == int(length) for p in existing)
 
 
+@dataclass
+class Outcome:
+    """Result of handling one book: 'downloaded', 'skipped' (already on disk) or 'unchanged'."""
+    status: str
+    path: Path | None = None
+    size: int = 0
+
+
+@dataclass
+class Summary:
+    downloaded: int = 0
+    skipped: int = 0
+    unchanged: int = 0
+    failed: int = 0
+
+
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ('B', 'KB', 'MB'):
+        if size < 1024:
+            return f'{size:.0f} {unit}' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+    return f'{size:.1f} GB'
+
+
 def download_product(session: requests.Session, product: Product, out_dir: Path, name: str | None = None,
-                     force: bool = False, update: bool = False) -> Path | None:
+                     force: bool = False, update: bool = False, label: str | None = None) -> Outcome:
     """Download one product into out_dir/<name>/<name>.<ext>.
 
-    Returns the file path, or None when skipped. Existing books are skipped
-    without any request, unless:
+    Existing books are skipped without any request, unless:
       - force:  always download again;
       - update: ask the server and download again only if the size differs
                 (or the server does not say), replacing the old file.
@@ -285,28 +317,34 @@ def download_product(session: requests.Session, product: Product, out_dir: Path,
     Any network or filesystem problem is raised as DownloadError.
     """
     name = name or safe_name(product.title)
+    label = label or product.title
     book_dir = out_dir / name
     tmp = book_dir / f'{name}.part'
     try:
         existing = [p for p in book_dir.glob(f'{name}.*') if p.suffix != '.part']
         if existing and not (force or update):
-            log.info('Skipping %s (already downloaded; use --update to check for a newer version)', product.title)
-            return None
+            log.info('%s: already downloaded, skipping', label)
+            return Outcome('skipped', existing[0])
 
         book_dir.mkdir(parents=True, exist_ok=True)
+        if update and existing:
+            log.info('%s: checking whether Manning has a newer version...', label)
+        else:
+            log.info('%s: downloading...', label)
         with session.post(DOWNLOAD_URL.format(external_id=product.external_id),
                           data=product.payload, stream=True, timeout=TIMEOUT) as resp:
             resp.raise_for_status()
             if resp.headers.get('Content-Type', '').startswith('text/html'):
-                raise DownloadError(f'Got an HTML page instead of a file for "{product.title}" '
-                                    '(session expired or download form changed).')
+                raise DownloadError(f'Got a web page instead of a file for "{product.title}" '
+                                    '(the session may have expired or the download form changed).')
             if update and not force and existing and _same_size(existing, resp.headers):
-                log.info('Skipping %s (unchanged)', product.title)
-                return None
-            log.info('Downloading %s ...', product.title)
+                log.info('%s: same size as your copy, skipping', label)
+                return Outcome('unchanged', existing[0])
+            size = 0
             with tmp.open('wb') as fh:
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                     fh.write(chunk)
+                    size += len(chunk)
             extension = _extension_from_headers(resp.headers) or product.guessed_extension
 
         target = book_dir / f'{name}{extension}'
@@ -315,7 +353,8 @@ def download_product(session: requests.Session, product: Product, out_dir: Path,
         for old in existing:
             if old != target:
                 old.unlink(missing_ok=True)
-        return target
+        log.info('%s: saved %s (%s)', label, target.name, human_size(size))
+        return Outcome('downloaded', target, size)
     # requests exceptions subclass OSError, so they must be handled first.
     except requests.RequestException as e:
         _discard(tmp)
@@ -334,16 +373,31 @@ def _discard(path: Path) -> None:
 
 
 def download_all(session: requests.Session, products: Sequence[Product], out_dir: Path,
-                 force: bool = False, update: bool = False) -> int:
-    """Download every product, continuing past failures. Returns the failure count."""
-    failures = 0
-    for product, name in zip(products, folder_names(products)):
+                 force: bool = False, update: bool = False, delay: float = DEFAULT_DELAY,
+                 sleep: Callable[[float], None] = time.sleep) -> Summary:
+    """Download every product, continuing past failures.
+
+    Pauses `delay` seconds before a book only if the previous book contacted the
+    server; books skipped from disk cost no request and need no pause.
+    """
+    summary = Summary()
+    total = len(products)
+    previous_used_network = False
+    for index, (product, name) in enumerate(zip(products, folder_names(products)), start=1):
+        if previous_used_network and delay > 0:
+            sleep(delay)
+        label = f'({index}/{total}) {product.title}'
         try:
-            download_product(session, product, out_dir, name=name, force=force, update=update)
+            outcome = download_product(session, product, out_dir, name=name,
+                                       force=force, update=update, label=label)
         except DownloadError as e:
-            failures += 1
-            log.error('%s', e)
-    return failures
+            summary.failed += 1
+            previous_used_network = True  # most failures happen after a request was made
+            log.error('(%d/%d) %s', index, total, e)
+            continue
+        setattr(summary, outcome.status, getattr(summary, outcome.status) + 1)
+        previous_used_network = outcome.status != 'skipped'
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -364,36 +418,105 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     mode.add_argument('-f', '--force', action='store_true', help='re-download all books, even if they exist')
     mode.add_argument('-U', '--update', action='store_true',
                       help='re-download existing books only when the server reports a different size')
+    parser.add_argument('--delay', type=float, default=DEFAULT_DELAY, metavar='SECONDS',
+                        help=f'pause between downloads to avoid being rate-limited (default: {DEFAULT_DELAY:g})')
     parser.add_argument('--user-agent', default=DEFAULT_USER_AGENT, help='HTTP User-Agent header to send')
-    parser.add_argument('-v', '--verbose', action='store_true', help='debug logging')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='more detail; -vv also shows every HTTP request')
     return parser.parse_args(list(argv) if argv is not None else None)
+
+
+class _Formatter(logging.Formatter):
+    """Plain messages for progress; a clear prefix for warnings and errors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return f'Error: {message}'
+        if record.levelno >= logging.WARNING:
+            return f'Warning: {message}'
+        return message
+
+
+def _setup_logging(verbosity: int) -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_Formatter('%(message)s'))
+    root = logging.getLogger()
+    # Replace only a handler we added earlier (main() may run more than once, e.g. in
+    # tests) and leave other handlers, such as pytest's log capture, untouched.
+    root.handlers[:] = [h for h in root.handlers if not isinstance(h.formatter, _Formatter)] + [handler]
+    root.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG if verbosity >= 1 else logging.INFO)
+    # Raw connection logs from urllib3 are only useful when debugging HTTP itself.
+    logging.getLogger('urllib3').setLevel(logging.DEBUG if verbosity >= 2 else logging.WARNING)
+
+
+def _credential_source(args: argparse.Namespace) -> str:
+    if args.keychain:
+        return f'the macOS Keychain (item "{args.keychain}")'
+    if args.password:
+        return 'the command line'
+    return 'the terminal prompt'
+
+
+def _save_dashboard(html: str, out_dir: Path) -> Path | None:
+    path = out_dir / DASHBOARD_DEBUG_FILE
+    try:
+        path.write_text(html, encoding='utf-8')
+    except OSError:
+        return None
+    return path
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format='%(message)s')
+    _setup_logging(args.verbose)
+    out_dir = args.output
 
     try:
+        log.info('[1/4] Reading your Manning login from %s...', _credential_source(args))
         username, password = resolve_credentials(args)
+
         with requests.Session() as session:
             session.headers['User-Agent'] = args.user_agent
+            log.info('[2/4] Signing in to Manning as %s...', username)
             login(session, username, password)
-            log.info('Logged in as %s', username)
+            log.info('      Signed in.')
 
+            log.info('[3/4] Loading your library from the Manning dashboard...')
             dashboard = session.get(DASHBOARD_URL, timeout=TIMEOUT)
             dashboard.raise_for_status()
-            products = parse_dashboard(dashboard.text)
-            log.info('Found %d downloadable books', len(products))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                products = parse_dashboard(dashboard.text)
+            except DashboardError as e:
+                products, reason = [], str(e)
+            else:
+                reason = 'No downloadable books were found on the dashboard.'
+            if not products:
+                saved = _save_dashboard(dashboard.text, out_dir)
+                log.error('%s Manning has probably changed the page layout, so the script needs updating.', reason)
+                if saved:
+                    log.error('The dashboard page was saved to %s; share it so the parser can be fixed.', saved)
+                return 1
+            log.info('      Found %d books with downloadable files.', len(products))
 
-            args.output.mkdir(parents=True, exist_ok=True)
-            failures = download_all(session, products, args.output, force=args.force, update=args.update)
+            log.info('[4/4] Downloading into %s (pausing %gs between downloads)...', out_dir.resolve(), args.delay)
+            summary = download_all(session, products, out_dir,
+                                   force=args.force, update=args.update, delay=args.delay)
     # OSError covers requests exceptions and an unwritable output directory.
-    except (CredentialError, LoginError, DashboardError, OSError) as e:
-        log.error('Error: %s', e)
+    except (CredentialError, LoginError, OSError) as e:
+        log.error('%s', e)
         return 1
 
-    log.info('Done: %d books, %d failed. Output: %s', len(products), failures, args.output.resolve())
-    return 1 if failures else 0
+    log.info('')
+    log.info('Done. Downloaded %d, skipped %d (already present), unchanged %d, failed %d.',
+             summary.downloaded, summary.skipped, summary.unchanged, summary.failed)
+    if summary.skipped and not args.update:
+        log.info('Tip: run with --update to check skipped books for newer versions.')
+    if summary.failed:
+        log.info('Run the same command again to retry the failed books.')
+    return 1 if summary.failed else 0
 
 
 if __name__ == '__main__':
