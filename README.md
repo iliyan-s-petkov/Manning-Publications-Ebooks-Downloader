@@ -46,6 +46,15 @@ Then run:
 
 The account email is read from the Keychain item. If you have several `manning` items, pick one with `-u user@domain.com`. On first use macOS may ask whether `security` may access the item; choose **Allow** (or **Always Allow**).
 
+### Alternative: type the password at a prompt
+
+Without `--keychain` or `-p`, the script asks for the email (unless `-u` is given) and reads the password with `getpass` (hidden input). This requires an interactive terminal; in cron or pipes use `--keychain`.
+
+```bash
+./manning.py -u user@domain.com
+# Manning password for user@domain.com:
+```
+
 ### Other options
 
 ```bash

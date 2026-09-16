@@ -174,10 +174,54 @@ def test_resolve_credentials_rejects_both_sources():
         manning.resolve_credentials(args)
 
 
-def test_resolve_credentials_requires_some_source():
+def _no_prompt(*_args):
+    raise AssertionError("must not prompt")
+
+
+def test_resolve_credentials_prompts_for_password_with_getpass():
+    args = manning.parse_args(["-u", "me@x.com"])
+    creds = manning.resolve_credentials(
+        args,
+        prompt_username=_no_prompt,
+        prompt_password=lambda prompt: "typed-pw",
+        is_interactive=lambda: True,
+    )
+    assert creds == ("me@x.com", "typed-pw")
+
+
+def test_resolve_credentials_prompts_for_username_and_password():
+    args = manning.parse_args([])
+    creds = manning.resolve_credentials(
+        args,
+        prompt_username=lambda prompt: "  me@x.com ",
+        prompt_password=lambda prompt: "typed-pw",
+        is_interactive=lambda: True,
+    )
+    assert creds == ("me@x.com", "typed-pw")
+
+
+def test_resolve_credentials_keychain_does_not_prompt():
+    args = manning.parse_args(["--keychain", "manning"])
+    creds = manning.resolve_credentials(
+        args,
+        keychain_reader=lambda service, account: ("me@x.com", "kc"),
+        prompt_username=_no_prompt,
+        prompt_password=_no_prompt,
+        is_interactive=lambda: True,
+    )
+    assert creds == ("me@x.com", "kc")
+
+
+def test_resolve_credentials_non_interactive_without_source_raises():
+    args = manning.parse_args(["-u", "me@x.com"])
+    with pytest.raises(manning.CredentialError, match="--keychain"):
+        manning.resolve_credentials(args, prompt_password=_no_prompt, is_interactive=lambda: False)
+
+
+def test_resolve_credentials_empty_prompted_password_raises():
     args = manning.parse_args(["-u", "me@x.com"])
     with pytest.raises(manning.CredentialError):
-        manning.resolve_credentials(args)
+        manning.resolve_credentials(args, prompt_password=lambda prompt: "", is_interactive=lambda: True)
 
 
 # --------------------------------------------------------------------------- #

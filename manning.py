@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import logging
 import re
 import subprocess
@@ -89,7 +90,11 @@ def read_keychain(service: str, account: str | None = None, run: Runner = subpro
 
 def resolve_credentials(args: argparse.Namespace,
                         keychain_reader: Callable[[str, str | None], tuple[str, str]] = read_keychain,
+                        prompt_username: Callable[[str], str] = input,
+                        prompt_password: Callable[[str], str] = getpass.getpass,
+                        is_interactive: Callable[[], bool] = lambda: sys.stdin.isatty(),
                         ) -> tuple[str, str]:
+    """Pick the credential source: Keychain, then -p, then an interactive getpass prompt."""
     if args.keychain and args.password:
         raise CredentialError('Use either --keychain or -p/--password, not both.')
     if args.keychain:
@@ -98,9 +103,19 @@ def resolve_credentials(args: argparse.Namespace,
         if not args.username:
             raise CredentialError('-p/--password requires -u/--username.')
         log.warning('Passing the password on the command line exposes it in shell history '
-                    'and the process list; prefer --keychain.')
+                    'and the process list; prefer --keychain or the interactive prompt.')
         return args.username, args.password
-    raise CredentialError('No credentials given. Use --keychain SERVICE (recommended) or -u EMAIL -p PASSWORD.')
+
+    # No stored secret given: ask on the terminal. Refuse when stdin is not a TTY
+    # (cron, pipes) so the script fails fast instead of hanging on a hidden prompt.
+    if not is_interactive():
+        raise CredentialError('No credentials given and not running interactively. '
+                              'Use --keychain SERVICE or -u EMAIL -p PASSWORD.')
+    username = args.username or prompt_username('Manning email: ').strip()
+    password = prompt_password(f'Manning password for {username}: ')
+    if not username or not password:
+        raise CredentialError('Email and password must not be empty.')
+    return username, password
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +267,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument('-k', '--keychain', metavar='SERVICE',
                         help='read credentials from the macOS Keychain generic password item with this service name')
     parser.add_argument('-u', '--username', metavar='EMAIL',
-                        help='Manning account email (optional with --keychain)')
+                        help='Manning account email (optional with --keychain; prompted if omitted)')
     parser.add_argument('-p', '--password', help='Manning password (insecure: visible in shell history)')
     parser.add_argument('-o', '--output', type=Path,
                         default=Path(f'Manning_{datetime.date.today():%Y-%m-%d}'),
